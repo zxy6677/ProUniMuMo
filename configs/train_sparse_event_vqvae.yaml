@@ -1,0 +1,101 @@
+model:
+  base_learning_rate: 2e-4
+  target: unimumo.models.sparse_event_vqvae.SparseSharedEventVQVAE
+  params:
+    monitor: "val/rec_loss"
+    music_key: "waveform"
+    motion_key: "motion"
+
+    loss_config:
+      target: unimumo.modules.loss.SparseEventLoss
+      params:
+        rec_weight: 1.0
+        commitment_weight: 0.02
+        ot_weight: 0.1
+        inv_weight: 0.0
+        sinkhorn_epsilon: 0.1
+        sinkhorn_iter: 30
+
+    motion_config:
+      input_dim: 263
+      output_dim: 128
+      emb_dim_encoder: [256, 224, 192, 144, 128]
+      emb_dim_decoder: [128, 144, 192, 224, 256]
+      input_fps: 60
+      rvq_fps: 50
+      dilation_growth_rate: 2
+      depth_per_res_block: 6
+      activation: "relu"
+
+    music_config:
+      vqvae_ckpt: "pretrained/music_vqvae.bin"
+
+    shared_event_config:
+      hidden_dim: 256
+      phase_dim: 32
+      role_num: 4
+      topk: 8
+
+    shared_quantizer_config:
+      target: unimumo.modules.shared_event_quantizer.SharedEventQuantizer
+      params:
+        event_dim: 128
+        n_q: 2
+        bins: 512
+        q_dropout: False
+        decay: 0.99
+        kmeans_init: True
+        kmeans_iters: 10
+        threshold_ema_dead_code: 2
+        orthogonal_reg_weight: 0.0
+        freeze_codebook: False
+        default_frame_rate: 50
+
+data:
+  target: train.DataModuleFromConfig
+  params:
+    batch_size: 7
+    wrap: True
+    num_workers: 4
+    train:
+      target: unimumo.data.paired_music_motion_dataset.PairedMusicMotionDataset
+      params:
+        split: "train"
+        pair_manifest: "data/pairs/train_pairs.jsonl"
+        music_dir: "data/music/audios"
+        motion_dir: "data/motion"
+        music_meta_dir: "data/music"
+        music_beat_dir: "data/music/music4all_beat"
+        duration: 2
+        motion_fps: 60
+
+    validation:
+      target: unimumo.data.paired_music_motion_dataset.PairedMusicMotionDataset
+      params:
+        split: "val"
+        pair_manifest: "data/pairs/val_pairs.jsonl"
+        music_dir: "data/music/audios"
+        motion_dir: "data/motion"
+        music_meta_dir: "data/music"
+        music_beat_dir: "data/music/music4all_beat"
+        duration: 2
+        motion_fps: 60
+
+lightning:
+  callbacks:
+    video_logger:
+      target: unimumo.loggers.MotionVQVAELogger
+      params:
+        motion_dir: "data/motion"
+        epoch_frequency: 10
+        batch_frequency: 4000
+        max_video_per_generation: 4
+        max_video_logged: 120
+        motion_fps: 60
+        disabled: False
+
+  trainer:
+    benchmark: True
+    devices: 6
+    num_nodes: 8
+    strategy: ddp
