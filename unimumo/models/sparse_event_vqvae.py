@@ -4,6 +4,7 @@ import torch
 import torch.nn as nn
 import pytorch_lightning as pl
 import typing as tp
+import torch.nn.functional as F
 
 from einops import rearrange
 from omegaconf import OmegaConf, DictConfig
@@ -24,6 +25,10 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         shared_event_config: dict,
         shared_quantizer_config: dict,
         loss_config: dict,
+        ot_warmup_start_step: int = 0,
+        ot_warmup_steps: int = 0,
+        ot_warmup_init_weight: float = 0.0,
+        ot_warmup_target_weight: tp.Optional[float] = None,
         ckpt_path: tp.Optional[str] = None,
         ignore_keys: tp.Optional[tp.List[str]] = None,
         music_key: str = "waveform",
@@ -34,6 +39,17 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         self.motion_key = motion_key
         self.music_key = music_key
         self.quantize_fps = shared_quantizer_config.get("params", {}).get("default_frame_rate", 50)
+        self.shared_bins = shared_quantizer_config.get("params", {}).get("bins", 128)
+        self.private_mask_ratio = shared_event_config.get("private_mask_ratio", 0.3)
+        self.shared_recon_weight = shared_event_config.get("shared_recon_weight", 0.1)
+        self.ot_warmup_start_step = ot_warmup_start_step
+        self.ot_warmup_steps = ot_warmup_steps
+        self.ot_warmup_init_weight = ot_warmup_init_weight
+        self.ot_warmup_target_weight = (
+            ot_warmup_target_weight
+            if ot_warmup_target_weight is not None
+            else loss_config.get("params", {}).get("ot_weight", 0.0)
+        )
                 # allow optional pretrained motion init
         motion_config = dict(motion_config)
         motion_vqvae_ckpt = motion_config.pop("vqvae_ckpt", None)
@@ -42,6 +58,8 @@ class SparseSharedEventVQVAE(pl.LightningModule):
 
         self.motion_encoder = Encoder(**motion_config)
         self.motion_decoder = Decoder(**motion_config)
+
+        self.music_shared_alpha = nn.Parameter(torch.tensor(-1.5))
 
         if motion_vqvae_ckpt is not None:
             self.init_motion_backbone_from_ckpt(motion_vqvae_ckpt)
@@ -89,10 +107,23 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             nn.Conv1d(latent_dim, latent_dim, 3, 1, 1),
         )
 
-        self.motion_fuse = nn.Sequential(
-            nn.Conv1d(latent_dim * 2, latent_dim * 2, 1),
+        self.music_shared_refiner = nn.Sequential(
+            nn.Conv1d(latent_dim, latent_dim, 3, 1, 1),
             nn.ELU(),
-            nn.Conv1d(latent_dim * 2, latent_dim, 3, 1, 1),
+            nn.Conv1d(latent_dim, latent_dim, 3, 1, 1),
+        )
+
+        self.motion_shared_proj = nn.Conv1d(latent_dim, latent_dim, 1)
+        self.music_shared_proj = nn.Conv1d(latent_dim, latent_dim, 1)
+
+        self.motion_gate_motion = nn.Sequential(
+            nn.Conv1d(latent_dim * 3, latent_dim, 1),
+            nn.ELU(),
+            nn.Conv1d(latent_dim, latent_dim, 1),
+        )
+
+        self.motion_gate_music = nn.Sequential(
+            nn.Conv1d(latent_dim * 3, latent_dim, 1),
             nn.ELU(),
             nn.Conv1d(latent_dim, latent_dim, 1),
         )
@@ -103,6 +134,72 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             self.monitor = monitor
         if ckpt_path is not None:
             self.init_from_ckpt(ckpt_path, ignore_keys=ignore_keys)
+
+
+    def _compute_code_stats(self, codes: torch.Tensor) -> dict:
+        """
+        codes: [B, n_q, K] or similar integer tensor
+        """
+        flat = codes.detach().reshape(-1).long()
+        flat = flat[(flat >= 0) & (flat < self.shared_bins)]
+
+        if flat.numel() == 0:
+            zero = torch.tensor(0.0, device=self.device)
+            return {
+                "usage": zero,
+                "perplexity": zero,
+                "perplexity_norm": zero,
+                "dead_codes": torch.tensor(float(self.shared_bins), device=self.device),
+            }
+
+        hist = torch.bincount(flat, minlength=self.shared_bins).float()
+        probs = hist / hist.sum().clamp_min(1.0)
+
+        used = (hist > 0).float()
+        usage = used.mean()
+
+        nz = probs > 0
+        entropy = -(probs[nz] * torch.log(probs[nz] + 1e-12)).sum()
+        perplexity = torch.exp(entropy)
+        perplexity_norm = perplexity / float(self.shared_bins)
+
+        dead_codes = (hist == 0).float().sum()
+
+        return {
+            "usage": usage,
+            "perplexity": perplexity,
+            "perplexity_norm": perplexity_norm,
+            "dead_codes": dead_codes,
+        }
+
+    def _get_current_ot_weight(self) -> float:
+        step = int(self.global_step)
+
+        if step < self.ot_warmup_start_step:
+            return float(self.ot_warmup_init_weight)
+
+        if self.ot_warmup_steps <= 0:
+            return float(self.ot_warmup_target_weight)
+
+        progress = (step - self.ot_warmup_start_step) / float(self.ot_warmup_steps)
+        progress = max(0.0, min(1.0, progress))
+
+        return float(
+            self.ot_warmup_init_weight
+            + progress * (self.ot_warmup_target_weight - self.ot_warmup_init_weight)
+        )
+
+    def _set_current_ot_weight(self):
+        current_ot_weight = self._get_current_ot_weight()
+
+        if hasattr(self.loss, "ot_weight"):
+            self.loss.ot_weight = current_ot_weight
+        else:
+            raise AttributeError(
+                "SparseEventLoss does not expose `ot_weight`, cannot apply OT warmup."
+            )
+
+        return current_ot_weight
 
     def init_from_ckpt(self, path: str, ignore_keys: tp.Optional[tp.List[str]] = None):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -259,6 +356,7 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             motion_q["x_q"], motion_event["indices"], seq_len
         )                                                          # [B, D, T]
 
+        music_shared_dense = self.music_shared_refiner(music_shared_dense)
         motion_shared_dense = self.motion_shared_refiner(motion_shared_dense)
 
         return {
@@ -276,10 +374,37 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         self,
         motion_private: torch.Tensor,
         motion_shared_dense: torch.Tensor,
+        music_shared_dense: torch.Tensor,
+        force_shared_only: bool = False,
     ) -> torch.Tensor:
-        fused_motion = self.motion_fuse(
-            torch.cat([motion_private, motion_shared_dense], dim=1)
-        )                                                          # [B, D, T]
+        if force_shared_only:
+            motion_private = torch.zeros_like(motion_private)
+        elif self.training and self.private_mask_ratio > 0:
+            keep = (
+                torch.rand(motion_private.shape[0], 1, 1, device=motion_private.device)
+                > self.private_mask_ratio
+            ).float()
+            motion_private = motion_private * keep
+
+        gate_in = torch.cat(
+            [motion_private, motion_shared_dense, music_shared_dense],
+            dim=1,
+        )
+
+        gate_motion = torch.sigmoid(self.motion_gate_motion(gate_in))
+        gate_music = torch.sigmoid(self.motion_gate_music(gate_in))
+
+        alpha = torch.sigmoid(self.music_shared_alpha)
+
+        motion_shared = self.motion_shared_proj(motion_shared_dense)
+        music_shared = self.music_shared_proj(music_shared_dense)
+
+        fused_motion = (
+            motion_private
+            + gate_motion * motion_shared
+            + gate_music * (alpha * music_shared)
+        )
+
         motion_recon = self.motion_decoder(fused_motion)
         motion_recon = rearrange(motion_recon, "b d t -> b t d")
         return motion_recon
@@ -291,9 +416,18 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         )
 
         shared_private = self.build_shared_private(music_emb, motion_emb)
+
         motion_recon = self.decode_motion(
             shared_private["motion_private"],
             shared_private["motion_shared_dense"],
+            shared_private["music_shared_dense"],
+        )
+
+        shared_only_recon = self.decode_motion(
+            shared_private["motion_private"],
+            shared_private["motion_shared_dense"],
+            shared_private["music_shared_dense"],
+            force_shared_only=True,
         )
 
         commitment_loss = 0.5 * (
@@ -304,6 +438,8 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         return {
             "motion_recon": motion_recon,
             "commitment_loss": commitment_loss,
+
+            "shared_only_recon": shared_only_recon,
 
             # continuous sparse events before RVQ
             "music_sparse_event_embeds": shared_private["music_event"]["sparse_event_embeds"],
@@ -352,19 +488,86 @@ class SparseSharedEventVQVAE(pl.LightningModule):
 
     def training_step(self, batch: tp.Dict[str, torch.Tensor], batch_idx: int):
         model_output = self(batch)
+        current_ot_weight = self._set_current_ot_weight()
         loss, log_dict = self.loss(batch[self.motion_key], model_output, split="train")
+        music_stats = self._compute_code_stats(model_output["music_shared_codes"])
+        motion_stats = self._compute_code_stats(model_output["motion_shared_codes"])
+        shared_recon_loss = F.mse_loss(model_output["shared_only_recon"], batch[self.motion_key])
+        loss = loss + self.shared_recon_weight * shared_recon_loss
+        log_dict["train/shared_recon_loss"] = shared_recon_loss.detach()
+        log_dict["train/total_loss_with_shared"] = loss.detach()
+        log_dict["train/ot_weight"] = torch.tensor(
+        current_ot_weight, device=self.device, dtype=torch.float32
+    )
+        log_dict["train/music_shared_alpha"] = torch.sigmoid(self.music_shared_alpha).detach()
 
-        self.log("aeloss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=False)
-        self.log_dict(log_dict, prog_bar=True, logger=True, on_step=True, on_epoch=False)
+
+        self.log("train/music_code_usage", music_stats["usage"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/music_code_perplexity", music_stats["perplexity"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/music_code_perplexity_norm", music_stats["perplexity_norm"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/music_dead_codes", music_stats["dead_codes"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+
+        self.log("train/motion_code_usage", motion_stats["usage"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/motion_code_perplexity", motion_stats["perplexity"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/motion_code_perplexity_norm", motion_stats["perplexity_norm"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log("train/motion_dead_codes", motion_stats["dead_codes"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+
+        self.log("aeloss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=False, sync_dist=True)
+        self.log_dict(log_dict, prog_bar=True, logger=True, on_step=True, on_epoch=False, sync_dist=True)
         return loss
 
     def validation_step(self, batch: tp.Dict[str, torch.Tensor], batch_idx: int):
         model_output = self(batch)
+        current_ot_weight = self._set_current_ot_weight()
         loss, log_dict = self.loss(batch[self.motion_key], model_output, split="val")
+        music_stats = self._compute_code_stats(model_output["music_shared_codes"])
+        motion_stats = self._compute_code_stats(model_output["motion_shared_codes"])
+        shared_recon_loss = F.mse_loss(model_output["shared_only_recon"], batch[self.motion_key])
+        val_total_loss_with_shared = loss + self.shared_recon_weight * shared_recon_loss
+        self.log(
+            "val/total_loss_with_shared",
+            val_total_loss_with_shared,
+            prog_bar=True,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log("val/shared_recon_loss", shared_recon_loss, prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
 
-        self.log("val/rec_loss", log_dict["val/rec_loss"], prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        self.log_dict(log_dict, prog_bar=True, logger=True, on_step=True, on_epoch=True)
-        return loss
+        self.log(
+            "val/ot_weight",
+            torch.tensor(current_ot_weight, device=self.device, dtype=torch.float32),
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        self.log(
+            "val/music_shared_alpha",
+            torch.sigmoid(self.music_shared_alpha).detach(),
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+
+        self.log("val/music_code_usage", music_stats["usage"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/music_code_perplexity", music_stats["perplexity"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/music_code_perplexity_norm", music_stats["perplexity_norm"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/music_dead_codes", music_stats["dead_codes"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+
+        self.log("val/motion_code_usage", motion_stats["usage"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/motion_code_perplexity", motion_stats["perplexity"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/motion_code_perplexity_norm", motion_stats["perplexity_norm"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log("val/motion_dead_codes", motion_stats["dead_codes"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+
+        self.log("val/rec_loss", log_dict["val/rec_loss"], prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        self.log_dict(log_dict, prog_bar=True, logger=True, on_step=False, on_epoch=True, sync_dist=True)
+        return val_total_loss_with_shared
 
     def configure_optimizers(self):
         lr = self.learning_rate
