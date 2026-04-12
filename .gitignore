@@ -16,3 +16,10 @@ data/
 *.mp4
 *.wav
 *.mp3
+# 日志
+*.log
+logs/
+runs/
+output/
+outputs/
+training_logs/
