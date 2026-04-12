@@ -5,13 +5,17 @@ model:
     monitor: "val/rec_loss"
     music_key: "waveform"
     motion_key: "motion"
+    ot_warmup_start_step: 1000
+    ot_warmup_steps: 1000
+    ot_warmup_init_weight: 0.0
+    ot_warmup_target_weight: 0.01
 
     loss_config:
       target: unimumo.modules.loss.SparseEventLoss
       params:
         rec_weight: 1.0
         commitment_weight: 0.02
-        ot_weight: 0.0
+        ot_weight: 0.01
         inv_weight: 0.0
         sinkhorn_epsilon: 0.1
         sinkhorn_iter: 30
