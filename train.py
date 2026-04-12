@@ -265,6 +265,7 @@ class SetupCallback(Callback):
 
 
 if __name__ == "__main__":
+    trainer = None
     now = datetime.datetime.now().strftime("%Y-%m-%dT%H-%M-%S")
     # add cwd for convenience and to make classes in this file available when
     # running as `python music_motion_main.py`
@@ -554,7 +555,7 @@ if __name__ == "__main__":
             raise
 
     except Exception:
-        if opt.debug and trainer.global_rank == 0:
+        if opt.debug and trainer is not None and trainer.global_rank == 0:
             try:
                 import pudb as debugger
             except ImportError:
@@ -562,11 +563,11 @@ if __name__ == "__main__":
             debugger.post_mortem()
         raise
     finally:
-        # move newly created debug project to debug_runs
-        if opt.debug and not opt.resume and trainer.global_rank == 0:
-            dst, name = os.path.split(logdir)
-            dst = os.path.join(dst, "debug_runs", name)
-            os.makedirs(os.path.split(dst)[0], exist_ok=True)
-            os.rename(logdir, dst)
-        if trainer.global_rank == 0:
-            print(trainer.profiler.summary())
+        if trainer is not None:
+            if opt.debug and not opt.resume and trainer.global_rank == 0:
+                dst, name = os.path.split(logdir)
+                dst = os.path.join(dst, "debug_runs", name)
+                os.makedirs(os.path.split(dst)[0], exist_ok=True)
+                os.rename(logdir, dst)
+            if trainer.global_rank == 0:
+                print(trainer.profiler.summary())

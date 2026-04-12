@@ -6,7 +6,7 @@ import pytorch_lightning as pl
 import typing as tp
 
 from einops import rearrange
-from omegaconf import OmegaConf
+from omegaconf import OmegaConf, DictConfig
 
 from unimumo.util import instantiate_from_config
 from unimumo.audio.audiocraft_.models.builders import get_compression_model
@@ -34,11 +34,17 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         self.motion_key = motion_key
         self.music_key = music_key
         self.quantize_fps = shared_quantizer_config.get("params", {}).get("default_frame_rate", 50)
+                # allow optional pretrained motion init
+        motion_config = dict(motion_config)
+        motion_vqvae_ckpt = motion_config.pop("vqvae_ckpt", None)
 
         self.music_encoder = self.instantiate_music_encoder(**music_config)
 
         self.motion_encoder = Encoder(**motion_config)
         self.motion_decoder = Decoder(**motion_config)
+
+        if motion_vqvae_ckpt is not None:
+            self.init_motion_backbone_from_ckpt(motion_vqvae_ckpt)
 
         latent_dim = motion_config["output_dim"]
         music_latent_dim = 128
@@ -110,16 +116,47 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         self.load_state_dict(sd, strict=False)
         print(f"Restored from {path}")
 
+    def _safe_torch_load(self, path: str):
+        try:
+            return torch.load(path, map_location="cpu", weights_only=False)
+        except TypeError:
+            return torch.load(path, map_location="cpu")
+
     def instantiate_music_encoder(
         self,
         vqvae_ckpt: str,
         vqvae_config: tp.Optional[tp.Any] = None,
     ) -> SEANetEncoder:
         if os.path.exists(vqvae_ckpt):
-            pkg = torch.load(vqvae_ckpt, map_location="cpu")
-            cfg = OmegaConf.create(pkg["xp.cfg"])
+            pkg = self._safe_torch_load(vqvae_ckpt)
+
+            if not isinstance(pkg, dict):
+                raise TypeError(f"Unexpected checkpoint type: {type(pkg)}")
+
+            # Case 1: old audiocraft-style checkpoint
+            if "xp.cfg" in pkg and "best_state" in pkg:
+                cfg = OmegaConf.create(pkg["xp.cfg"])
+                state_dict = pkg["best_state"]
+
+            # Case 2: UniMuMo packaged full.ckpt
+            elif "music_vqvae_config" in pkg and "music_vqvae_weight" in pkg:
+                cfg = pkg["music_vqvae_config"]
+                if isinstance(cfg, dict):
+                    cfg = OmegaConf.create(cfg)
+                elif not isinstance(cfg, DictConfig):
+                    cfg = OmegaConf.create(cfg)
+                state_dict = pkg["music_vqvae_weight"]
+
+            else:
+                raise KeyError(
+                    "Checkpoint format mismatch. "
+                    f"Expected keys ['xp.cfg', 'best_state'] or "
+                    f"['music_vqvae_config', 'music_vqvae_weight'], "
+                    f"got keys: {list(pkg.keys())[:20]}"
+                )
+
             model = get_compression_model(cfg)
-            model.load_state_dict(pkg["best_state"])
+            model.load_state_dict(state_dict, strict=True)
         else:
             assert vqvae_config is not None
             model = get_compression_model(vqvae_config)
@@ -128,6 +165,55 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         for p in encoder.parameters():
             p.requires_grad = False
         return encoder
+
+    def init_motion_backbone_from_ckpt(self, ckpt_path: str):
+        if not os.path.exists(ckpt_path):
+            raise FileNotFoundError(f"motion vqvae ckpt not found: {ckpt_path}")
+
+        pkg = self._safe_torch_load(ckpt_path)
+
+        if not isinstance(pkg, dict):
+            raise TypeError(f"Unexpected checkpoint type: {type(pkg)}")
+
+        if "motion_vqvae_weight" not in pkg:
+            raise KeyError(
+                f"Expected 'motion_vqvae_weight' in checkpoint, got keys: {list(pkg.keys())[:20]}"
+            )
+
+        state_dict = pkg["motion_vqvae_weight"]
+
+        encoder_sd = {}
+        decoder_sd = {}
+
+        # common case: saved keys prefixed with encoder. / decoder.
+        for k, v in state_dict.items():
+            if k.startswith("encoder."):
+                encoder_sd[k[len("encoder."):]] = v
+            elif k.startswith("decoder."):
+                decoder_sd[k[len("decoder."):]] = v
+
+        # fallback: sparse-event-style names
+        if len(encoder_sd) == 0 and len(decoder_sd) == 0:
+            for k, v in state_dict.items():
+                if k.startswith("motion_encoder."):
+                    encoder_sd[k[len("motion_encoder."):]] = v
+                elif k.startswith("motion_decoder."):
+                    decoder_sd[k[len("motion_decoder."):]] = v
+
+        if len(encoder_sd) == 0:
+            raise KeyError("Could not find encoder weights in motion_vqvae_weight")
+        if len(decoder_sd) == 0:
+            raise KeyError("Could not find decoder weights in motion_vqvae_weight")
+
+        missing_e, unexpected_e = self.motion_encoder.load_state_dict(encoder_sd, strict=False)
+        missing_d, unexpected_d = self.motion_decoder.load_state_dict(decoder_sd, strict=False)
+
+        print("[motion init] encoder missing:", missing_e)
+        print("[motion init] encoder unexpected:", unexpected_e)
+        print("[motion init] decoder missing:", missing_d)
+        print("[motion init] decoder unexpected:", unexpected_d)
+        print(f"[motion init] restored motion encoder/decoder from {ckpt_path}")
+
 
     def encode_backbone(
         self,
@@ -299,3 +385,5 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         joint = self.motion_vec_to_joint(motion_recon, motion_mean, motion_std)
         gt_joint = self.motion_vec_to_joint(batch[self.motion_key], motion_mean, motion_std)
         return waveform, joint, gt_joint
+
+        

@@ -1,11 +1,10 @@
 model:
-  base_learning_rate: 2e-4
+  base_learning_rate: 0.0002
   target: unimumo.models.sparse_event_vqvae.SparseSharedEventVQVAE
   params:
-    monitor: "val/rec_loss"
-    music_key: "waveform"
-    motion_key: "motion"
-
+    monitor: val/rec_loss
+    music_key: waveform
+    motion_key: motion
     loss_config:
       target: unimumo.modules.loss.SparseEventLoss
       params:
@@ -15,58 +14,62 @@ model:
         inv_weight: 0.0
         sinkhorn_epsilon: 0.1
         sinkhorn_iter: 30
-
     motion_config:
       input_dim: 263
       output_dim: 128
-      emb_dim_encoder: [256, 224, 192, 144, 128]
-      emb_dim_decoder: [128, 144, 192, 224, 256]
+      emb_dim_encoder:
+      - 256
+      - 224
+      - 192
+      - 144
+      - 128
+      emb_dim_decoder:
+      - 128
+      - 144
+      - 192
+      - 224
+      - 256
       input_fps: 60
       rvq_fps: 50
       dilation_growth_rate: 2
       depth_per_res_block: 6
-      activation: "relu"
-      vqvae_ckpt: "pretrained/full.ckpt"
-
+      activation: relu
+      vqvae_ckpt: pretrained/full.ckpt
     music_config:
-      vqvae_ckpt: "pretrained/full.ckpt"
-
+      vqvae_ckpt: pretrained/full.ckpt
     shared_event_config:
       hidden_dim: 256
       phase_dim: 32
       role_num: 4
       topk: 8
-
     shared_quantizer_config:
       target: unimumo.modules.shared_event_quantizer.SharedEventQuantizer
       params:
         event_dim: 128
         n_q: 1
         bins: 128
-        q_dropout: False
+        q_dropout: false
         decay: 0.99
-        kmeans_init: True
+        kmeans_init: true
         kmeans_iters: 10
         threshold_ema_dead_code: 2
         orthogonal_reg_weight: 0.0
-        freeze_codebook: False
+        freeze_codebook: false
         default_frame_rate: 50
-
 data:
   target: train.DataModuleFromConfig
   params:
     batch_size: 7
     wrap: true
     num_workers: 4
-
     train:
       target: unimumo.data.music_motion_paired_data.MusicMotionPairedDataset
       params:
-        split: "train"
-        pair_manifest: "data/FineDance/splits/train_pairs.jsonl"
-        music_root: "data/FineDance/music_wav"
-        motion_root: "data/FineDance_preprocessed/motion_vec263_fps60"
-        stats_root: "data/FineDance_preprocessed"
+        split: train
+        pair_manifest: data/FineDance/splits/train_pairs.jsonl
+        music_root: data/FineDance/music_wav
+        motion_root: data/FineDance_preprocessed/motion_vec263_fps60
+        stats_root: data/FineDance_preprocessed
         duration: 2.0
         motion_fps: 60
         music_sr: 32000
@@ -74,15 +77,14 @@ data:
         random_crop: true
         pad_short: true
         return_meta: false
-
     validation:
       target: unimumo.data.music_motion_paired_data.MusicMotionPairedDataset
       params:
-        split: "val"
-        pair_manifest: "data/FineDance/splits/val_pairs.jsonl"
-        music_root: "data/FineDance/music_wav"
-        motion_root: "data/FineDance_preprocessed/motion_vec263_fps60"
-        stats_root: "data/FineDance_preprocessed"
+        split: val
+        pair_manifest: data/FineDance/splits/val_pairs.jsonl
+        music_root: data/FineDance/music_wav
+        motion_root: data/FineDance_preprocessed/motion_vec263_fps60
+        stats_root: data/FineDance_preprocessed
         duration: 2.0
         motion_fps: 60
         music_sr: 32000
@@ -90,22 +92,3 @@ data:
         random_crop: false
         pad_short: true
         return_meta: false
-
-lightning:
-  callbacks:
-    video_logger:
-      target: unimumo.loggers.MotionVQVAELogger
-      params:
-        motion_dir: "data/motion"
-        epoch_frequency: 10
-        batch_frequency: 4000
-        max_video_per_generation: 4
-        max_video_logged: 120
-        motion_fps: 60
-        disabled: False
-
-  trainer:
-    benchmark: True
-    devices: 2
-    num_nodes: 1
-    strategy: ddp
