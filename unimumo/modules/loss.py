@@ -5,12 +5,28 @@ import torch.nn.functional as F
 
 
 class SinkhornOTLoss(nn.Module):
-    def __init__(self, epsilon: float = 0.1, max_iter: int = 30):
+    def __init__(
+        self,
+        epsilon: float = 0.1,
+        max_iter: int = 30,
+        lambda_idx: float = 0.0,
+        lambda_phase: float = 0.0,
+    ):
         super().__init__()
         self.epsilon = epsilon
         self.max_iter = max_iter
+        self.lambda_idx = lambda_idx
+        self.lambda_phase = lambda_phase
 
-    def forward(self, x: torch.Tensor, y: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        y: torch.Tensor,
+        x_idx: torch.Tensor = None,
+        y_idx: torch.Tensor = None,
+        x_phase: torch.Tensor = None,
+        y_phase: torch.Tensor = None,
+    ) -> torch.Tensor:
         """
         x: [B, Kx, D]
         y: [B, Ky, D]
@@ -18,7 +34,35 @@ class SinkhornOTLoss(nn.Module):
         x = F.normalize(x, dim=-1)
         y = F.normalize(y, dim=-1)
 
-        cost = 1.0 - torch.bmm(x, y.transpose(1, 2))  # [B, Kx, Ky]
+        cost = 1.0 - torch.bmm(x, y.transpose(1, 2))
+
+        if x_idx is not None and y_idx is not None and self.lambda_idx > 0:
+            idx_cost = torch.abs(
+                x_idx.float().unsqueeze(2) - y_idx.float().unsqueeze(1)
+            )
+            idx_cost = idx_cost / idx_cost.max().clamp_min(1.0)
+            cost = cost + self.lambda_idx * idx_cost
+
+        if x_phase is not None and y_phase is not None and self.lambda_phase > 0:
+            if x_phase.dim() == 3 and y_phase.dim() == 3:
+                # phase 是向量 / embedding: [B, K, D_phase]
+                x_phase = F.normalize(x_phase, dim=-1)
+                y_phase = F.normalize(y_phase, dim=-1)
+                phase_cost = 1.0 - torch.bmm(x_phase, y_phase.transpose(1, 2))
+            elif x_phase.dim() == 2 and y_phase.dim() == 2:
+                # phase 是标量 / id: [B, K]
+                phase_cost = torch.abs(
+                    x_phase.float().unsqueeze(2) - y_phase.float().unsqueeze(1)
+                )
+                phase_cost = phase_cost / phase_cost.max().clamp_min(1.0)
+            else:
+                raise ValueError(
+                    f"Unexpected phase shapes: x_phase={x_phase.shape}, y_phase={y_phase.shape}"
+                )
+
+            cost = cost + self.lambda_phase * phase_cost
+        
+        
         b, kx, ky = cost.shape
 
         log_a = torch.full((b, kx), -math.log(kx), device=cost.device, dtype=cost.dtype)
@@ -43,10 +87,15 @@ class SparseEventLoss(nn.Module):
         commitment_weight: float = 0.02,
         ot_weight: float = 0.1,
         inv_weight: float = 0.0,
+        meta_weight: float = 0.02,
         sinkhorn_epsilon: float = 0.1,
         sinkhorn_iter: int = 30,
+        lambda_idx: float = 0.0,
+        lambda_phase: float = 0.0,
     ):
         super().__init__()
+        self.meta_weight = meta_weight
+        self.meta_loss = nn.MSELoss()
         self.rec_weight = rec_weight
         self.commitment_weight = commitment_weight
         self.ot_weight = ot_weight
@@ -57,6 +106,8 @@ class SparseEventLoss(nn.Module):
         self.ot = SinkhornOTLoss(
             epsilon=sinkhorn_epsilon,
             max_iter=sinkhorn_iter,
+            lambda_idx=lambda_idx,
+            lambda_phase=lambda_phase,
         )
 
     def forward(self, motion_gt: torch.Tensor, model_output: dict, split: str = "train"):
@@ -68,7 +119,14 @@ class SparseEventLoss(nn.Module):
         motion_shared = model_output["motion_quantized_sparse_events"]
 
         rec_loss = self.recon_loss(motion_recon.contiguous(), motion_gt.contiguous())
-        ot_loss = self.ot(music_shared, motion_shared)
+        ot_loss = self.ot(
+            music_shared,
+            motion_shared,
+            x_idx=model_output["music_event_indices"],
+            y_idx=model_output["motion_event_indices"],
+            x_phase=model_output["music_phase"],
+            y_phase=model_output["motion_phase"],
+        )
 
         if (
             "music_quantized_sparse_events_aug" in model_output and
@@ -89,11 +147,32 @@ class SparseEventLoss(nn.Module):
         else:
             inv_loss = torch.zeros_like(rec_loss)
 
+        if (
+            "music_meta_pred" in model_output and
+            "motion_meta_pred" in model_output and
+            "music_meta_target" in model_output and
+            "motion_meta_target" in model_output
+        ):
+            music_meta_loss = self.meta_loss(
+                model_output["music_meta_pred"],
+                model_output["music_meta_target"],
+            )
+            motion_meta_loss = self.meta_loss(
+                model_output["motion_meta_pred"],
+                model_output["motion_meta_target"],
+            )
+            meta_loss = 0.5 * (music_meta_loss + motion_meta_loss)
+        else:
+            music_meta_loss = torch.zeros_like(rec_loss)
+            motion_meta_loss = torch.zeros_like(rec_loss)
+            meta_loss = torch.zeros_like(rec_loss)
+
         total = (
             self.rec_weight * rec_loss +
             self.commitment_weight * commitment_loss +
             self.ot_weight * ot_loss +
-            self.inv_weight * inv_loss
+            self.inv_weight * inv_loss +
+            self.meta_weight * meta_loss
         )
 
         log = {
@@ -102,6 +181,9 @@ class SparseEventLoss(nn.Module):
             f"{split}/commitment_loss": commitment_loss.detach().mean(),
             f"{split}/ot_loss": ot_loss.detach().mean(),
             f"{split}/inv_loss": inv_loss.detach().mean(),
+            f"{split}/meta_loss": meta_loss.detach().mean(),
+            f"{split}/music_meta_loss": music_meta_loss.detach().mean(),
+            f"{split}/motion_meta_loss": motion_meta_loss.detach().mean(),
         }
         return total, log
 

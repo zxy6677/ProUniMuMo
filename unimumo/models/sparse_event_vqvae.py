@@ -14,7 +14,8 @@ from unimumo.audio.audiocraft_.models.builders import get_compression_model
 from unimumo.audio.audiocraft_.modules.seanet import SEANetEncoder
 from unimumo.motion.motion_process import recover_from_ric
 from unimumo.modules.motion_vqvae_module import Encoder, Decoder
-from unimumo.modules.event_head import EventHead, scatter_sparse_tokens
+from unimumo.modules.event_head import EventHead
+from unimumo.modules.shared_event_context import SharedEventContext
 
 
 class SparseSharedEventVQVAE(pl.LightningModule):
@@ -86,8 +87,10 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             phase_dim=shared_event_config.get("phase_dim", 32),
             role_num=shared_event_config.get("role_num", 4),
             topk=shared_event_config.get("topk", 8),
+            window_topk=shared_event_config.get("window_topk", False),
+            window_size=shared_event_config.get("window_size", 25),
+            topk_per_window=shared_event_config.get("topk_per_window", 2),
         )
-
         self.motion_event_head = EventHead(
             input_dim=latent_dim,
             event_dim=latent_dim,
@@ -95,10 +98,26 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             phase_dim=shared_event_config.get("phase_dim", 32),
             role_num=shared_event_config.get("role_num", 4),
             topk=shared_event_config.get("topk", 8),
+            window_topk=shared_event_config.get("window_topk", False),
+            window_size=shared_event_config.get("window_size", 25),
+            topk_per_window=shared_event_config.get("topk_per_window", 2),
         )
-
         # NEW: dedicated shared sparse-event codebook
         self.shared_event_quantizer = instantiate_from_config(shared_quantizer_config)
+
+        self.shared_context_sigma = shared_event_config.get("shared_context_sigma", 2.0)
+
+        self.music_context_builder = SharedEventContext(
+            event_dim=latent_dim,
+            sigma=self.shared_context_sigma,
+            use_event_mlp=True,
+        )
+
+        self.motion_context_builder = SharedEventContext(
+            event_dim=latent_dim,
+            sigma=self.shared_context_sigma,
+            use_event_mlp=True,
+        )
 
         # scatter sparse events -> dense timeline, then smooth / spread locally
         self.motion_shared_refiner = nn.Sequential(
@@ -126,6 +145,18 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             nn.Conv1d(latent_dim * 3, latent_dim, 1),
             nn.ELU(),
             nn.Conv1d(latent_dim, latent_dim, 1),
+        )
+
+        self.music_meta_head = nn.Sequential(
+            nn.Conv1d(latent_dim, latent_dim, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv1d(latent_dim, 1, 1),
+        )
+
+        self.motion_meta_head = nn.Sequential(
+            nn.Conv1d(latent_dim, latent_dim, 3, 1, 1),
+            nn.GELU(),
+            nn.Conv1d(latent_dim, 1, 1),
         )
 
         self.loss = instantiate_from_config(loss_config)
@@ -200,6 +231,34 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             )
 
         return current_ot_weight
+
+    def _normalize_meta_target(self, x: torch.Tensor) -> torch.Tensor:
+        # x: [B, 1, T]
+        return x / x.amax(dim=-1, keepdim=True).clamp_min(1e-6)
+
+    def _compute_music_energy_target(
+        self,
+        waveform: torch.Tensor,
+        target_len: int,
+    ) -> torch.Tensor:
+        # waveform: [B, 1, L]
+        energy = torch.sqrt(F.adaptive_avg_pool1d(waveform.pow(2), target_len) + 1e-8)
+        energy = self._normalize_meta_target(energy)
+        return energy
+
+    def _compute_motion_energy_target(
+        self,
+        motion: torch.Tensor,
+        target_len: int,
+    ) -> torch.Tensor:
+        # motion: [B, T, D]
+        vel = motion[:, 1:] - motion[:, :-1]          # [B, T-1, D]
+        vel_energy = vel.abs().mean(dim=-1)           # [B, T-1]
+        vel_energy = torch.cat([vel_energy[:, :1], vel_energy], dim=1)  # [B, T]
+        vel_energy = vel_energy.unsqueeze(1)          # [B, 1, T]
+        vel_energy = F.adaptive_avg_pool1d(vel_energy, target_len)
+        vel_energy = self._normalize_meta_target(vel_energy)
+        return vel_energy
 
     def init_from_ckpt(self, path: str, ignore_keys: tp.Optional[tp.List[str]] = None):
         sd = torch.load(path, map_location="cpu")["state_dict"]
@@ -348,13 +407,17 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             frame_rate=self.quantize_fps,
         )
 
-        music_shared_dense = scatter_sparse_tokens(
-            music_q["x_q"], music_event["indices"], seq_len
-        )                                                          # [B, D, T]
+        music_shared_dense = self.music_context_builder(
+            music_q["x_q"],
+            music_event["indices"],
+            seq_len,
+        )
 
-        motion_shared_dense = scatter_sparse_tokens(
-            motion_q["x_q"], motion_event["indices"], seq_len
-        )                                                          # [B, D, T]
+        motion_shared_dense = self.motion_context_builder(
+            motion_q["x_q"],
+            motion_event["indices"],
+            seq_len,
+        )                                                       # [B, D, T]
 
         music_shared_dense = self.music_shared_refiner(music_shared_dense)
         motion_shared_dense = self.motion_shared_refiner(motion_shared_dense)
@@ -407,7 +470,12 @@ class SparseSharedEventVQVAE(pl.LightningModule):
 
         motion_recon = self.motion_decoder(fused_motion)
         motion_recon = rearrange(motion_recon, "b d t -> b t d")
-        return motion_recon
+
+        aux = {
+            "gate_motion_mean": gate_motion.mean(),
+            "gate_music_mean": gate_music.mean(),
+        }
+        return motion_recon, aux
 
     def forward(self, batch: tp.Dict[str, torch.Tensor]) -> dict:
         music_emb, motion_emb = self.encode_backbone(
@@ -417,13 +485,27 @@ class SparseSharedEventVQVAE(pl.LightningModule):
 
         shared_private = self.build_shared_private(music_emb, motion_emb)
 
-        motion_recon = self.decode_motion(
+        shared_seq_len = shared_private["motion_shared_dense"].shape[-1]
+
+        music_meta_pred = self.music_meta_head(shared_private["music_shared_dense"])   # [B, 1, Tq]
+        motion_meta_pred = self.motion_meta_head(shared_private["motion_shared_dense"]) # [B, 1, Tq]
+
+        music_meta_target = self._compute_music_energy_target(
+            batch[self.music_key],
+            shared_seq_len,
+        )
+        motion_meta_target = self._compute_motion_energy_target(
+            batch[self.motion_key],
+            shared_seq_len,
+        )
+
+        motion_recon, motion_aux = self.decode_motion(
             shared_private["motion_private"],
             shared_private["motion_shared_dense"],
             shared_private["music_shared_dense"],
         )
 
-        shared_only_recon = self.decode_motion(
+        shared_only_recon, shared_only_aux = self.decode_motion(
             shared_private["motion_private"],
             shared_private["motion_shared_dense"],
             shared_private["music_shared_dense"],
@@ -462,6 +544,14 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             "motion_phase": shared_private["motion_event"]["sparse_phase"],
             "music_role_prob": shared_private["music_event"]["sparse_role_prob"],
             "motion_role_prob": shared_private["motion_event"]["sparse_role_prob"],
+            "music_meta_pred": music_meta_pred,
+            "motion_meta_pred": motion_meta_pred,
+            "music_meta_target": music_meta_target,
+            "motion_meta_target": motion_meta_target,
+            "gate_motion_mean": motion_aux["gate_motion_mean"],
+            "gate_music_mean": motion_aux["gate_music_mean"],
+            "shared_only_gate_motion_mean": shared_only_aux["gate_motion_mean"],
+            "shared_only_gate_music_mean": shared_only_aux["gate_music_mean"],
         }
 
     @torch.no_grad()
@@ -511,6 +601,42 @@ class SparseSharedEventVQVAE(pl.LightningModule):
         self.log("train/motion_code_perplexity", motion_stats["perplexity"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/motion_code_perplexity_norm", motion_stats["perplexity_norm"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
         self.log("train/motion_dead_codes", motion_stats["dead_codes"], prog_bar=False, logger=True, on_step=True, on_epoch=True, sync_dist=True)
+        self.log(
+            "train/gate_motion_mean",
+            model_output["gate_motion_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/gate_music_mean",
+            model_output["gate_music_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/shared_only_gate_motion_mean",
+            model_output["shared_only_gate_motion_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "train/shared_only_gate_music_mean",
+            model_output["shared_only_gate_music_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=True,
+            on_epoch=True,
+            sync_dist=True,
+        )
 
         self.log("aeloss", loss, prog_bar=True, logger=True, on_step=True, on_epoch=False, sync_dist=True)
         self.log_dict(log_dict, prog_bar=True, logger=True, on_step=True, on_epoch=False, sync_dist=True)
@@ -554,7 +680,42 @@ class SparseSharedEventVQVAE(pl.LightningModule):
             on_epoch=True,
             sync_dist=True,
         )
-
+        self.log(
+            "val/gate_motion_mean",
+            model_output["gate_motion_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val/gate_music_mean",
+            model_output["gate_music_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val/shared_only_gate_motion_mean",
+            model_output["shared_only_gate_motion_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
+        self.log(
+            "val/shared_only_gate_music_mean",
+            model_output["shared_only_gate_music_mean"],
+            prog_bar=False,
+            logger=True,
+            on_step=False,
+            on_epoch=True,
+            sync_dist=True,
+        )
         self.log("val/music_code_usage", music_stats["usage"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/music_code_perplexity", music_stats["perplexity"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)
         self.log("val/music_code_perplexity_norm", music_stats["perplexity_norm"], prog_bar=False, logger=True, on_step=False, on_epoch=True, sync_dist=True)

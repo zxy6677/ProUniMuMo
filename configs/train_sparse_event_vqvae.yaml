@@ -19,6 +19,9 @@ model:
         inv_weight: 0.0
         sinkhorn_epsilon: 0.1
         sinkhorn_iter: 30
+        lambda_idx: 0.2
+        lambda_phase: 0.1
+        meta_weight: 0.005
 
     motion_config:
       input_dim: 263
@@ -40,6 +43,11 @@ model:
       phase_dim: 32
       role_num: 4
       topk: 8
+      shared_context_sigma: 2.0
+      window_topk: true
+      window_size: 25
+      topk_per_window: 2
+      shared_recon_weight: 0.02
 
     shared_quantizer_config:
       target: unimumo.modules.shared_event_quantizer.SharedEventQuantizer

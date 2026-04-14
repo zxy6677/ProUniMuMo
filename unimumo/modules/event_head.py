@@ -90,12 +90,18 @@ class EventHead(nn.Module):
         phase_dim: int = 32,
         role_num: int = 4,
         topk: int = 8,
+        window_topk: bool = False,
+        window_size: int = 25,
+        topk_per_window: int = 2,
     ):
         super().__init__()
         self.event_dim = event_dim
         self.phase_dim = phase_dim
         self.role_num = role_num
         self.topk = topk
+        self.window_topk = window_topk
+        self.window_size = window_size
+        self.topk_per_window = topk_per_window
 
         self.content_proj = nn.Sequential(
             nn.Conv1d(input_dim, hidden_dim, 1),
@@ -135,6 +141,44 @@ class EventHead(nn.Module):
             nn.Linear(event_dim, event_dim),
         )
 
+    def _select_event_indices(self, saliency_logits: torch.Tensor) -> torch.Tensor:
+        """
+        saliency_logits: [B, T]
+        return:
+            indices: [B, K]
+        """
+        b, t = saliency_logits.shape
+
+        if not self.window_topk:
+            k = min(self.topk, t)
+            _, indices = torch.topk(saliency_logits, k=k, dim=1, largest=True, sorted=False)
+            indices = torch.sort(indices, dim=1).values
+            return indices
+
+        if self.window_size <= 0:
+            raise ValueError(f"window_size must be > 0, got {self.window_size}")
+        if self.topk_per_window <= 0:
+            raise ValueError(f"topk_per_window must be > 0, got {self.topk_per_window}")
+
+        all_indices = []
+        for start in range(0, t, self.window_size):
+            end = min(start + self.window_size, t)
+            local_logits = saliency_logits[:, start:end]   # [B, Tw]
+            local_k = min(self.topk_per_window, end - start)
+
+            _, local_idx = torch.topk(
+                local_logits,
+                k=local_k,
+                dim=1,
+                largest=True,
+                sorted=False,
+            )
+            all_indices.append(local_idx + start)
+
+        indices = torch.cat(all_indices, dim=1)           # [B, K_total]
+        indices = torch.sort(indices, dim=1).values
+        return indices
+
     def forward(self, x: torch.Tensor) -> dict:
         # x: [B, C, T]
         assert x.dim() == 3, f"Expected [B, C, T], got {x.shape}"
@@ -146,9 +190,7 @@ class EventHead(nn.Module):
         phase = torch.sigmoid(self.phase_head(x).squeeze(1))                  # [B, T], [0,1]
         role_logits = self.role_head(x).transpose(1, 2).contiguous()          # [B, T, R]
 
-        k = min(self.topk, saliency_logits.size(1))
-        _, indices = torch.topk(saliency_logits, k=k, dim=1, largest=True, sorted=False)
-        indices = torch.sort(indices, dim=1).values                           # keep temporal order
+        indices = self._select_event_indices(saliency_logits)
 
         sparse_content = _batched_gather_txd(content, indices)                # [B, K, D]
         sparse_saliency_logits = _batched_gather_txd(
@@ -186,4 +228,5 @@ class EventHead(nn.Module):
             "sparse_role_logits": sparse_role_logits,
             "sparse_role_prob": sparse_role_prob,
             "sparse_event_embeds": sparse_event_embeds,
+            "num_sparse_events": torch.tensor(indices.shape[1], device=indices.device),
         }
